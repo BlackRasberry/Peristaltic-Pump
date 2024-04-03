@@ -2,15 +2,17 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
-#include <Adafruit_TMP117.h>
-#include <Adafruit_Sensor.h>
 #include <TMC2209.h>
 #include "FS.h"
 #include "SD.h"
+#include "RTClib.h"
 
 Adafruit_SH1107 display = Adafruit_SH1107(64, 128, &Wire); //create the OLED Display
 HardwareSerial & serial_stream = Serial2; //create the UART connection to stepper driver
 TMC2209 stepper_driver; //create the driver
+TMC2209::Settings settings = stepper_driver.getSettings();
+TMC2209::Status status = stepper_driver.getStatus();
+RTC_PCF8523 rtc;
 
 #define BUTTON_A 34 //sel
 #define BUTTON_B 4 //dec
@@ -18,7 +20,7 @@ TMC2209 stepper_driver; //create the driver
 #define BUTTON_D 32 //next
 #define BUTTON_E 14  //before
 
-#define BUTTON_1 15 //prime
+#define BUTTON_1 15 //prime 
 #define BUTTON_2 33 //33 = error!!! Start/stop //25=A1 so dont be hopeful it works.... possible to share cs pin?
 #define BUTTON_3 27 //cal 
 #define BUTTON_4 36 //cw/ccw
@@ -39,19 +41,23 @@ int pulseSeconds = 0;
 int pulseTimeTotal = 0;
 int pulseTimeTotalReserve = 0;
 double pulseVolume = 1.000; //Microliter presision, get preferred default value from SD card maybe?
+double onceVolume = 1.000; //ml
+double onceSpeed = 2.0;
 int pulseRepeat = 0;
 double pumpRate = 4.000; // Bring in from card settings "default pump mL/m"
-double maxPumpRate = 4.000; // Bring in from card
 int primeLength = 10; //cm bring from card
 int primeTime = 0; //s
 int maxLengthPerMinute = 60; //cm
 int calTime = 60; //s
 int reserve = calTime;
+int shutdownTimer = 120; //s
 double revolutionsPerformed = calTime/8; //calculate how many revolutions were performed during calibration period
-double mlPerRevolution = 0.07; // figure out real number from SD card
+double mlPerRevolution = 3.680/30; // figure out real number from SD card
+double maxPumpRate = mlPerRevolution*(calTime/2); //~3.800ml/m
 double mlPerEighth = mlPerRevolution/8;
 bool direction = HIGH; //High = cw
 double maxBatteryVoltage = 26.0; // pull from settings
+bool disableShutdown = false;
 
 //Motor Variables
 const int stepsPerRevolution = 200;
@@ -67,14 +73,15 @@ const int RX_PIN = 7;
 const int TX_PIN = 8;
 const int DELAY = 500;
 const int32_t VELOCITY = 20000;
-uint16_t microsteps_per_step = 16;
-const uint8_t RUN_CURRENT_PERCENT = 100;
+uint16_t microsteps_per_step = 16; //16
+const uint8_t RUN_CURRENT_PERCENT = 40;
+const uint8_t STOP_CURRENT_PERCENT = 1;
 const TMC2209::CurrentIncrement CURRENT_INCREMENT = TMC2209::CURRENT_INCREMENT_8;
 const TMC2209::MeasurementCount MEASUREMENT_COUNT = TMC2209::MEASUREMENT_COUNT_1;
 const uint32_t COOL_STEP_DURATION_THRESHOLD = 2000;
 const uint8_t COOL_STEP_LOWER_THRESHOLD = 1;
 const uint8_t COOL_STEP_UPPER_THRESHOLD = 0;
-bool cool_step_enabled = false;
+bool cool_step_enabled = true;
 
 void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
     Serial.printf("Listing directory: %s\n", dirname);
@@ -239,6 +246,68 @@ void setup() {
   
   Serial.begin(SERIAL_BAUD_RATE);
 
+  //The following is from the Adafruit RTC example library
+  #ifndef ESP8266
+    while (!Serial); // wait for serial port to connect. Needed for native USB
+  #endif
+
+  if (! rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    Serial.flush();
+    while (1) delay(10);
+  }
+
+  if (! rtc.initialized() || rtc.lostPower()) {
+    Serial.println("RTC is NOT initialized, let's set the time!");
+    // When time needs to be set on a new device, or after a power loss, the
+    // following line sets the RTC to the date & time this sketch was compiled
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // This line sets the RTC with an explicit date & time, for example to set
+    // January 21, 2014 at 3am you would call:
+    // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+    //
+    // Note: allow 2 seconds after inserting battery or applying external power
+    // without battery before calling adjust(). This gives the PCF8523's
+    // crystal oscillator time to stabilize. If you call adjust() very quickly
+    // after the RTC is powered, lostPower() may still return true.
+  }
+
+  // When time needs to be re-set on a previously configured device, the
+  // following line sets the RTC to the date & time this sketch was compiled
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  // This line sets the RTC with an explicit date & time, for example to set
+  // January 21, 2014 at 3am you would call:
+  // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+
+  // When the RTC was stopped and stays connected to the battery, it has
+  // to be restarted by clearing the STOP bit. Let's do this to ensure
+  // the RTC is running.
+  rtc.start();
+
+   // The PCF8523 can be calibrated for:
+  //        - Aging adjustment
+  //        - Temperature compensation
+  //        - Accuracy tuning
+  // The offset mode to use, once every two hours or once every minute.
+  // The offset Offset value from -64 to +63. See the Application Note for calculation of offset values.
+  // https://www.nxp.com/docs/en/application-note/AN11247.pdf
+  // The deviation in parts per million can be calculated over a period of observation. Both the drift (which can be negative)
+  // and the observation period must be in seconds. For accuracy the variation should be observed over about 1 week.
+  // Note: any previous calibration should cancelled prior to any new observation period.
+  // Example - RTC gaining 43 seconds in 1 week
+  float drift = 43; // seconds plus or minus over oservation period - set to 0 to cancel previous calibration.
+  float period_sec = (7 * 86400);  // total obsevation period in seconds (86400 = seconds in 1 day:  7 days = (7 * 86400) seconds )
+  float deviation_ppm = (drift / period_sec * 1000000); //  deviation in parts per million (μs)
+  float drift_unit = 4.34; // use with offset mode PCF8523_TwoHours
+  // float drift_unit = 4.069; //For corrections every min the drift_unit is 4.069 ppm (use with offset mode PCF8523_OneMinute)
+  int offset = round(deviation_ppm / drift_unit);
+  // rtc.calibrate(PCF8523_TwoHours, offset); // Un-comment to perform calibration once drift (seconds) and observation period (seconds) are correct
+  // rtc.calibrate(PCF8523_TwoHours, 0); // Un-comment to cancel previous calibration
+
+  Serial.print("Offset is "); Serial.println(offset); // Print to control offset
+
+
+
   stepper_driver.setup(serial_stream, SERIAL_BAUD_RATE, TMC2209::SERIAL_ADDRESS_0, RX_PIN, TX_PIN);
 
   stepper_driver.setRunCurrent(RUN_CURRENT_PERCENT);
@@ -246,6 +315,9 @@ void setup() {
   stepper_driver.setCoolStepMeasurementCount(MEASUREMENT_COUNT);
   stepper_driver.setCoolStepDurationThreshold(COOL_STEP_DURATION_THRESHOLD);
   stepper_driver.setMicrostepsPerStep(microsteps_per_step);
+  //stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
+  stepper_driver.enableStealthChop();
+  //stepper_driver.setMicrostepsPerStep(8);
   stepper_driver.enable();
   pinMode(13, OUTPUT);
   delay(300);
@@ -352,54 +424,63 @@ void setup() {
     } else {
         Serial.println("UNKNOWN");
     }
+    /*
+
+    char settings[2][10] = {char(mlPerRevolution), "Setting 2"}
 
     uint64_t cardSize = SD.cardSize() / (1024 * 1024); //report the card size
     Serial.printf("SD Card Size: %lluMB\n", cardSize);
-
+ */
     listDir(SD, "/", 0);
     createDir(SD, "/mydir"); //create default directory in case card is fresh
     listDir(SD, "/", 0);
     removeDir(SD, "/mydir");
     listDir(SD, "/", 2);
-    writeFile(SD, "/hello.txt", "Hello ");
-    appendFile(SD, "/hello.txt", "World!\n");
-    readFile(SD, "/hello.txt");
-    deleteFile(SD, "/foo.txt");
-    renameFile(SD, "/hello.txt", "/foo.txt");
-    readFile(SD, "/foo.txt");
-    testFileIO(SD, "/test.txt");
+    writeFile(SD, "/settings.txt", "Hello ");
+    appendFile(SD, "/settings.txt", "World!\n");
+    readFile(SD, "/settings.txt");
+    //deleteFile(SD, "/foo.txt");
+    //renameFile(SD, "/hello.txt", "/foo.txt");
+    //readFile(SD, "/foo.txt");
+    //testFileIO(SD, "/test.txt");
     Serial.printf("Total space: %lluMB\n", SD.totalBytes() / (1024 * 1024));
     Serial.printf("Used space: %lluMB\n", SD.usedBytes() / (1024 * 1024));
+    //writeFile(SD, "/hello.txt", "Hello ");
+    //readFile(SD, "/hello.txt");
 }
-
-//setup
 
 //a function that rotates the pump in increments of 1/8th of a revolution
 void eighthPump(double eighths, double speed) { //speed should be 1=100%speed, 2=200%speed 0.5=50% etc.
   Serial.println("pumping " + String(eighths) + "/8 of a revolution.");
-  int steps = stepsPerRevolution*eighths*2;
-  for(int x = 0; x < steps; x++)
-	{
-		digitalWrite(stepPin, HIGH);
-		delayMicroseconds(1000*(1/speed));
-		digitalWrite(stepPin, LOW);
-		delayMicroseconds(1000*(1/speed));
-	}
+  int steps = stepsPerRevolution*2; //*eighths
+  tempCheck();
+  for(int y = 0; y < eighths; y++){
+    for(int x = 0; x < steps; x++)
+    {
+      digitalWrite(stepPin, HIGH);
+      delayMicroseconds(1000*(1/speed));
+      digitalWrite(stepPin, LOW);
+      delayMicroseconds(1000*(1/speed));
+      if(digitalRead(BUTTON_2) == LOW) {break; menu=1; submenu=2;}
+    }
+    if(digitalRead(BUTTON_B) == LOW) {if ((menu == 1)&&(submenu == 1)){pumpRate = pumpRate - 0.05; break;}} //Dec
+    if(digitalRead(BUTTON_C) == LOW) {if ((menu == 1)&&(submenu == 1)){pumpRate = pumpRate + 0.05; break;}} //Inc
+    if(digitalRead(BUTTON_D) == LOW) {if ((menu == 1)&&(submenu == 1)){pumpRate = pumpRate + 1; break;}} //Next
+    if(digitalRead(BUTTON_E) == LOW) {if ((menu == 1)&&(submenu == 1)){pumpRate = pumpRate - 1; break;}} //Before
+  }
 }
 
-void velocityPump(double rate){
-  double ratio = (rate/maxPumpRate);
-  Serial.print("pumping velocity at");
-  Serial.print(rate);
-  Serial.print(" or ");
-  Serial.println(ratio);
-  eighthPump(1,ratio);
+void velocityPump(double rate){ //rate is user input of ml/min
+  double mlPerSecond = rate/60;
+  double ratio = (mlPerSecond/mlPerRevolution)*(6.67);
+  eighthPump(2048,ratio);
+  
 }
 
-uint8_t i=0;
-void loop() {
+void batteryCheck(){
   double voltage = analogRead(batterySense) * (33.2 / 4095.0); //gets the battery voltage. typical range: 23-26V
-  if((voltage < 23.5) && (voltage > 5)){//23.5
+  if(((voltage < 23.5) && (voltage > 5)) && (!disableShutdown)){ //23.5
+    display.oled_command(SH110X_DISPLAYON);
     display.clearDisplay();
     display.setTextSize(2);
     display.setTextColor(SH110X_WHITE);
@@ -408,28 +489,96 @@ void loop() {
     display.println("Critical!!");
     display.println(String(voltage) + " V");
     display.display(); // actually display all of the above
-    delay(2000);
+    for (int i = 0; i < 20; i++)
+    {
+      if(digitalRead(BUTTON_A) == LOW) 
+      {
+        disableShutdown = true;
+        delay(200);
+        menu = 0; submenu = 0;
+        return;
+      }
+    delay(100);
+    }
     display.clearDisplay();
     display.setContrast(0);
     display.display();
     display.oled_command(SH110X_DISPLAYOFF);
-    //ESP.deepSleep(60e10);
-    esp_sleep_enable_timer_wakeup(864005e6);//sleep for a day
-    //pinMode(BUTTON_4, OUTPUT);  /Use this for disabling the tmc2209. Pick which button to disable for enabling the motor. Test what the power draw is with the pin cut off first
-    //digitalWrite(BUTTON_4, HIGH);
-    esp_light_sleep_start();
+    stepper_driver.enableStealthChop();
+    stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
+    stepper_driver.disable();
+    esp_sleep_enable_timer_wakeup(86400e6);//sleep for a day
+    esp_deep_sleep_start();
   }
 
+}
+
+void tempCheck(){
+    if(status.over_temperature_120c == 1){
+      delay(120); //Wait 2 minutes if the driver is overheating.
+      Serial.println("Driver Overheating, Waiting 2 Minutes.");
+    }
+}
+
+int pastSecond = 0;
+bool secondPassed(){
+  DateTime now = rtc.now();
+  int currentSecond = now.second();
+  if((currentSecond > pastSecond) || ((currentSecond == 0)&&(pastSecond == 59)))
+  {
+    pastSecond = currentSecond;
+    Serial.print("Second Passed: ");
+    Serial.println(currentSecond);
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+uint8_t i=0;
+void loop() {
+  DateTime now = rtc.now();
+
+  if ((disableShutdown) && (secondPassed())){ //Allows the user 120 seconds to use the pump if shutdown is disabled
+      shutdownTimer = shutdownTimer - 1;
+    if (shutdownTimer == 0){
+      disableShutdown = false;
+      shutdownTimer = 120;
+    }
+  }
+  /*
+  if(secondPassed()){
+    stepper_driver.disableStealthChop();
+    eighthPump(4,8);
+    stepper_driver.enableStealthChop();
+    }
+  */
+  /*
+  Serial.print(now.year(), DEC);
+    Serial.print('/');
+    Serial.print(now.month(), DEC);
+    Serial.print('/');
+    Serial.print(now.day(), DEC);
+    Serial.print('/');
+    Serial.print(now.hour(), DEC);
+    Serial.print(':');
+    Serial.print(now.minute(), DEC);
+    Serial.print(':');
+    Serial.print(now.second(), DEC);
+    Serial.println();
+  */
+  display.oled_command(SH110X_DISPLAYON);
+  double voltage = analogRead(batterySense) * (33.2 / 4095.0); //gets the battery voltage. typical range: 23-26V
+  batteryCheck();
+  tempCheck();
+  //Serial.println(String(menu) + " " + String(submenu));
 
   if (not stepper_driver.isSetupAndCommunicating())
   {
     Serial.println("Stepper driver not setup and communicating. ESP may have crashed.");
     //return;
-  }
-
-  if (stepper_driver.isSetupAndCommunicating())
-  {
-    //Serial.println("UART OK");
   }
 
   if (cool_step_enabled)
@@ -443,17 +592,20 @@ void loop() {
 
   int wait = 300;
   if(digitalRead(BUTTON_A) == LOW) {
-    Serial.println("Sel"); 
+    Serial.println("Sel");
     if ((menu == 0) && (submenu == 0)) {menu = 1; submenu = 0;}
     else if ((menu == 0) && (submenu == 1)) {menu = 2; submenu = 0;}
     else if ((menu == 4) && (submenu == 2)) {menu = 4; submenu = 3;}
-    else if ((menu == 0) && (submenu == 2)) {menu = 3; submenu = 0;}
+    else if ((menu == 0) && (submenu == 3)) {menu = 3; submenu = 0;}
     else if ((menu == 3) && (submenu == 0)) {menu = 6; submenu = 0;}
     else if ((menu == 3) && (submenu == 1)) {menu = 7; submenu = 0;}
     else if ((menu == 3) && (submenu == 2)) {menu = 8; submenu = 0;}
     else if ((menu == 2) && (submenu == 4)) {menu = 2; submenu = 5;}
     else if ((menu == 3) && (submenu == 3)) {menu = 9; submenu = 0;}
     else if ((menu == 9) && (submenu == 0)) {menu = 0; submenu = 0;}
+    else if ((menu == 0) && (submenu == 2)) {menu = 10; submenu = 0;}
+    else if ((menu == 10) && (submenu == 0)) {menu = 10; submenu = 2;}
+    else if ((menu == 10) && (submenu == 2)) {menu = 10; submenu = 0;}
 
     delay(wait); }
   
@@ -467,6 +619,8 @@ void loop() {
     else if((menu == 2) && (submenu == 4) && (pulseVolume > 0)) {pulseVolume = pulseVolume - 0.005;}
     else if((menu == 2) && (submenu == 5)) {pulseRepeat = pulseRepeat - 1;}
     else if((menu == 4) && (submenu == 2)) {maxPumpRate = maxPumpRate - 0.005;}
+    else if((menu == 10) && (submenu == 0)) {onceVolume = onceVolume - 0.005;}
+    else if((menu == 10) && (submenu == 2)) {onceSpeed = onceSpeed - 0.05;}
     else if((menu == 6) && (submenu == 0) && (primeLength > 0)) {primeLength = primeLength - 1;}
     else if((menu == 7) && (submenu == 0) && (calTime > 60)) {calTime = calTime - 60;}
     delay(wait); }
@@ -481,26 +635,32 @@ void loop() {
     else if((menu == 2) && (submenu == 4)) {pulseVolume = pulseVolume + 0.005;}
     else if((menu == 2) && (submenu == 5)) {pulseRepeat = pulseRepeat + 1;}
     else if((menu == 4) && (submenu == 2)) {maxPumpRate = maxPumpRate + 0.005;}
+    else if((menu == 10) && (submenu == 0)) {onceVolume = onceVolume + 0.005;}
+    else if((menu == 10) && (submenu == 2)) {onceSpeed = onceSpeed + 0.05;}
     else if((menu == 6) && (submenu == 0)) {primeLength = primeLength + 1;}
     else if((menu == 7) && (submenu == 0)) {calTime = calTime + 60;}
     delay(wait); }
 
   if(digitalRead(BUTTON_D) == LOW) {
     Serial.println("Next");
-    if((menu != 4) && (menu != 5) && (menu != 1) && ((menu != 2) && (menu != 9) || (submenu != 4) && (submenu != 5)))
+    if((menu != 4) && (menu != 5) && (menu != 1) && ((menu != 2) && (menu != 9) || (submenu != 4) && (submenu != 5)) && (menu != 10))
       submenu = submenu + 1;
     else if((menu == 4) && (submenu == 2)) {maxPumpRate = maxPumpRate + 1.000;}
     else if((menu == 1) && (submenu == 0)) {pumpRate = pumpRate + 1.000;}
     else if((menu == 2) && (submenu == 4)) {pulseVolume = pulseVolume + 1.000;}
+    else if((menu == 10) && (submenu == 0)) {onceVolume = onceVolume + 1.000;}
+    else if((menu == 10) && (submenu == 2)) {onceSpeed = onceSpeed + 1.000;}
     delay(wait); }
 
   if(digitalRead(BUTTON_E) == LOW) {
     Serial.println("Before");
-    if((menu != 4) && (menu != 5) && (menu != 1) && ((menu != 2) && (menu != 9) || ((submenu != 4) && (submenu = !5))))
+    if((menu != 4) && (menu != 5) && (menu != 1) && ((menu != 2) && (menu != 9) || ((submenu != 4) && (submenu = !5))) && (menu != 10))
       submenu = submenu - 1;
     else if((menu == 4) && (submenu == 2)) {maxPumpRate = maxPumpRate - 1.000;}
     else if((menu == 1) && (submenu == 0)) {pumpRate = pumpRate - 1.000;}
     else if((menu == 2) && (submenu == 4)) {pulseVolume = pulseVolume - 1.000;}
+    else if((menu == 10) && (submenu == 0)) {onceVolume = onceVolume - 1.000;}
+    else if((menu == 10) && (submenu == 2)) {onceSpeed = onceSpeed - 1.000;}
     delay(wait); }
 
   if(digitalRead(BUTTON_1) == LOW) {
@@ -517,7 +677,8 @@ void loop() {
     else if((menu == 1) && (submenu == 1)){submenu = 2;}
     else if((menu == 2) && (submenu == 5)){submenu = 6;}
     else if((menu == 9) && (submenu == 0)){submenu = 1;}
-
+    else if((menu == 10) && (submenu == 0)){submenu = 1;}
+    else if((menu == 10) && (submenu == 2)){submenu = 1;}
     delay(wait);}
   if(digitalRead(BUTTON_3) == LOW) {
    Serial.println("Cal");
@@ -554,11 +715,18 @@ void loop() {
         display.clearDisplay();
         display.setCursor(0,0);
         display.println("Mode:");
+        display.println("Once Pump");
+        display.println("Push Sel");
+      }
+      else if(submenu == 3) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.println("Mode:");
         display.println("Settings");
         display.println("Push Sel");
       }
-      if(submenu == 3) {
-        submenu = 2;
+      if(submenu == 4) {
+        submenu = 3;
       }
       if(submenu == -1) {
         submenu = 0;
@@ -572,6 +740,7 @@ void loop() {
         display.println(" " + String(pumpRate, 3));
         display.println("Max:" + String(maxPumpRate));
         display.println("Push Start");
+        stepper_driver.disableStealthChop();
       }
       if(submenu == 1) {
         display.clearDisplay();
@@ -583,6 +752,8 @@ void loop() {
         velocityPump(pumpRate);
       }
       if(submenu == 2) {
+        stepper_driver.enableStealthChop();
+        stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
         display.clearDisplay();
         display.setCursor(0,0);
         display.println("Stopping..");
@@ -659,7 +830,10 @@ void loop() {
       if(submenu == 7) {
         bool powerSaver = false;
         double numEighths = pulseVolume/mlPerEighth; //pump once before starting (requested)
-        eighthPump(numEighths,4);
+        stepper_driver.disableStealthChop();
+        stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
+        eighthPump(numEighths,2.5);
+        stepper_driver.enableStealthChop();
 
         int j = 0; int k = 0;
         if(pulseRepeat == 0) {pulseRepeat = 99999999999999;}
@@ -668,9 +842,13 @@ void loop() {
           if(powerSaver){
             display.oled_command(SH110X_DISPLAYOFF);
             esp_sleep_enable_timer_wakeup(pulseTimeTotal*1e6);//5 seconds
+            batteryCheck();
             esp_light_sleep_start();
             double numEighths = pulseVolume/mlPerEighth; 
-            eighthPump(numEighths,4);
+            stepper_driver.disableStealthChop();
+            eighthPump(numEighths,2.5);
+            stepper_driver.enableStealthChop();
+            stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
 
             if(digitalRead(BUTTON_2) == LOW) {break;}
           }
@@ -704,7 +882,9 @@ void loop() {
         if(digitalRead(BUTTON_2) == LOW) {menu = 1; submenu = 2; display.setContrast(100); break;}
 
         double numEighths = pulseVolume/mlPerEighth; 
-        eighthPump(numEighths,4);
+        stepper_driver.disableStealthChop();
+        eighthPump(numEighths,2.5);
+        stepper_driver.enableStealthChop();
         menu = 0; submenu = 0; display.setContrast(100);
           }//else
         }//for
@@ -756,6 +936,7 @@ void loop() {
         display.setCursor(0,0);
         display.println("Calibrate");
         display.println("Push Start");
+        reserve = calTime;
       }
       if(submenu == 1) {
         display.clearDisplay();
@@ -763,10 +944,17 @@ void loop() {
         display.println("Calibrate");
         display.println(String(calTime / 60) + " m " + String(calTime % 60) + " s");
         display.println("remaining");
-        calTime = calTime - 1;
         display.display();
-        eighthPump(4,3.33315);//pump one half revolution for exactly 1 second. 1/8 = 0.8333 speed
-        if(calTime == 0) {submenu = 2; calTime = reserve;} //pull this 60 from sd card "calibration time"
+        if(digitalRead(BUTTON_2) == LOW) {menu=1; submenu=2;}
+          
+        if(secondPassed()){
+        stepper_driver.disableStealthChop();
+        eighthPump(4,8);//pump one half revolution for exactly 1 second. 1/8 = 0.8333 speed
+        stepper_driver.enableStealthChop();
+        calTime = calTime - 1;
+        //stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
+        }
+        if(calTime == 0) {submenu = 2; calTime = reserve; maxPumpRate = maxPumpRate * (reserve / 60);} //pull this 60 from sd card "calibration time"
       }
       if(submenu == 2) {
         display.clearDisplay();
@@ -781,9 +969,9 @@ void loop() {
         display.println("Saving...");
         display.display();
         calTime = reserve;
-        mlPerRevolution = maxPumpRate/(revolutionsPerformed*4); //calculate how many mL per revolution
+        maxPumpRate = maxPumpRate/(calTime/60); //1  min cal remains unchanged. 2 min divides by 2
+        mlPerRevolution = maxPumpRate/(calTime/2); //calculate how many mL per revolution
         mlPerEighth = mlPerRevolution/8;
-        Serial.println(revolutionsPerformed*4);
         //Write to SD card. Update Settings: mlPerRevolution
         delay(500);
         display.println("Done!");
@@ -815,6 +1003,7 @@ void loop() {
         display.display();
         display.clearDisplay();
         display.setCursor(0,0);
+        stepper_driver.disableStealthChop();
         eighthPump(primeRotations,primeSpeed);
         eighthPump(primeRevs,4);
 
@@ -888,6 +1077,8 @@ void loop() {
         display.setCursor(0,0);
         eighthPump(primeRevs,4);
 
+        stepper_driver.enableStealthChop();
+        stepper_driver.setHoldCurrent(STOP_CURRENT_PERCENT);
         display.println("Done!");
         display.println("Primed ");
         display.println(String(primeLength) + " cm");
@@ -965,12 +1156,12 @@ void loop() {
         display.clearDisplay();
         display.setCursor(0,0);
         display.setTextSize(1);
-        display.println("Motor Driver:");
+        display.println("FWV: 1.0.b");
         display.println("BTT TMC 2209 V1.3");
         display.println("Controller:");
-        display.println("Adafruit Fether ESP V2");
-        display.println("SD Card Size:");
-        display.println("1 GB");
+        display.println("Adafruit Fether ESPV2");
+        display.printf("Total SD space: %lluMB\n", SD.totalBytes() / (1024 * 1024));
+        display.printf("Used SD space: %lluMB\n", SD.usedBytes() / (1024 * 1024));
         display.println("Push Next");
         display.setTextSize(2);
       }
@@ -1029,11 +1220,54 @@ void loop() {
           submenu = 0;
         }
       break;
+    case 10: //Once Pump menu
+      if(submenu == 0) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.setTextSize(2);
+        display.println("Push Start");
+        display.println("to pump:");
+        display.println(String(onceVolume,3) + " ml");
+        display.setTextSize(1);
+        display.println("Push Sel to set speed");
+        display.setTextSize(2);
+        display.display();
+      }
+      if(submenu == 1) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.setTextSize(2);
+        display.println("Pumping");
+        display.println(String(onceVolume,3) + " at");
+        display.println(String(onceSpeed));
+        display.display();
+        double numEighths = onceVolume/mlPerEighth; 
+        stepper_driver.disableStealthChop();
+        eighthPump(numEighths,onceSpeed);
+        stepper_driver.enableStealthChop();
+        display.setTextSize(2);
+        display.println("Done!");
+        display.display();
+        delay(1000);
+        menu = 10; submenu = 0; 
+      }
+      if(submenu == 2) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.setTextSize(2);
+        display.println("Speed:");
+        display.println(String(onceSpeed,3));
+        display.setTextSize(1);
+        display.println("Press Sel to set volume");
+        display.setTextSize(2);
+        display.display();
+      }
+        if(submenu == 3) {
+          submenu = 2;
+        }
+        if(submenu == -1) {
+          submenu = 0;
+        }
+      break;
   } //switch
-} //loop
-
-
-
-
-
-    
+}
